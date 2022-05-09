@@ -56,10 +56,6 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp)-WSIZE)))
 #define PREV_BLKP(bp) ((char *)(bp)-GET_SIZE(((char *)(bp)-DSIZE)))
 
-/*return address of Previous or Next free block*/
-#define PRED_P(bp) (*(void **)(bp))
-#define SUCC_P(bp) (*(void **)((bp) + WSIZE))
-
 /*-- PROTOTYPES -- */
 int mm_init(void);
 void *mm_malloc(size_t size);
@@ -69,42 +65,48 @@ static void *coalesce(void *ptr);
 static void *extend_heap(size_t words);
 static void *find_fit(size_t asize);
 static void place(void *bp, size_t asize);
-static void *connect_root(void *ptr);
-static void *change_point(void *ptr);
 
 /*pointer of heap*/
-static void *heap_listp; /* points to the start of the heap */
+static char *heap_listp; /* points to the start of the heap */
+
 /*
- * mm_init - initialize the malloc package.
+ * coalesce - connect blocks if free block is adjacent to current freed block
  */
-int mm_init(void)
+static void *coalesce(void *ptr)
 {
-    /*1. set 6words for initiate*/
-    /*''24bytes''(total initial bytes)*/
-    if ((heap_listp = mem_sbrk(6 * WSIZE)) == (void *)-1)
+    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(ptr)));
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
+    size_t size = GET_SIZE(HDRP(ptr));
+
+    /*case 1. adjacent blocks are all allocated */
+    if (prev_alloc && next_alloc)
     {
-        return -1;
+        return ptr;
     }
-    /*2. allocate unused padding word as start of heap*/
-    PUT(heap_listp, 0);
-    /*3. allocate prologue header(block size : 16, allocated : 1)*/
-    PUT(heap_listp + (1 * WSIZE), PACK(2 * DSIZE, 1));
-    /*4. pointer of prev free block */
-    PUT(heap_listp + (2 * WSIZE), heap_listp + (3 * WSIZE));
-    /*5. pointer of Next free block*/
-    PUT(heap_listp + (3 * WSIZE), heap_listp + (2 * WSIZE));
-    /*6. allocate prologue footer(block size : 16, allocated : 1)*/
-    PUT(heap_listp + (4 * WSIZE), PACK(2 * DSIZE, 1));
-    /*7. allocate epilogue header(block size : 0, allocated : 1)*/
-    PUT(heap_listp + (5 * WSIZE), PACK(0, 1));
-    /*8. move block pointer for setting payload data*/
-    heap_listp += (2 * WSIZE);
-    /*9. extend empty heap by CHUNKSIZE size*/
-    if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
+    /*case 2. next block of adjacent blocks is free */
+    else if (prev_alloc && !next_alloc)
     {
-        return -1;
+        size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+        PUT(HDRP(ptr), PACK(size, 0));
+        PUT(FTRP(ptr), PACK(size, 0));
     }
-    return 0;
+    /*case 3. previous block of adjacent blocks is free */
+    else if (!prev_alloc && next_alloc)
+    {
+        size += GET_SIZE(HDRP(PREV_BLKP(ptr)));
+        PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
+        PUT(FTRP(ptr), PACK(size, 0));
+        ptr = PREV_BLKP(ptr);
+    }
+    /*case 4. all adjacent block are free */
+    else
+    {
+        size += GET_SIZE(HDRP(PREV_BLKP(ptr))) + GET_SIZE(FTRP(NEXT_BLKP(ptr)));
+        PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
+        PUT(FTRP(NEXT_BLKP(ptr)), PACK(size, 0));
+        ptr = PREV_BLKP(ptr);
+    }
+    return ptr;
 }
 
 /*
@@ -134,6 +136,73 @@ static void *extend_heap(size_t words)
 
     /*6. connect blocks if needed*/
     return coalesce(ptr);
+}
+
+/*
+ * mm_init - initialize the malloc package.
+ */
+int mm_init(void)
+{
+    /*1. set 4words for initiate*/
+    if ((heap_listp = mem_sbrk(4 * WSIZE)) == (void *)-1)
+    {
+        return -1;
+    }
+    /*2. allocate unused padding word as start of heap*/
+    PUT(heap_listp, 0);
+    /*3. allocate prologue header(block size : 8, allocated : 1)*/
+    PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, 1));
+    /*4. allocate prologue footer(block size : 8, allocated : 1)*/
+    PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1));
+    /*5. allocate epilogue header(block size : 0, allocated : 1)*/
+    PUT(heap_listp + (3 * WSIZE), PACK(0, 1));
+
+    /*6. move block pointer for setting payload data*/
+    heap_listp += (2 * WSIZE);
+    /*7. extend empty heap by CHUNKSIZE size*/
+    if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
+    {
+        return -1;
+    }
+    return 0;
+}
+/*
+ * find_fit - find available block in free list
+ */
+static void *find_fit(size_t asize)
+{
+    void *bp;
+    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
+    {
+        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp))))
+        {
+            return bp;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * place - memory of adjusted size is allocated in available block
+ */
+static void place(void *bp, size_t asize)
+{
+    size_t csize = GET_SIZE(HDRP(bp));
+    /* minimum bytes we can allocate is 16 bytes. */
+    if ((csize - asize) >= (2 * DSIZE))
+    {
+        PUT(HDRP(bp), PACK(asize, 1));
+        PUT(FTRP(bp), PACK(asize, 1));
+        bp = NEXT_BLKP(bp);
+        PUT(HDRP(bp), PACK(csize - asize, 0));
+        PUT(FTRP(bp), PACK(csize - asize, 0));
+    }
+    else
+    {
+        // after allocate, if left available block size is lower than 16 bytes(minimum bytes), total block size is allocated
+        PUT(HDRP(bp), PACK(csize, 1));
+        PUT(FTRP(bp), PACK(csize, 1));
+    }
 }
 
 /*
@@ -177,69 +246,6 @@ void *mm_malloc(size_t size)
     place(bp, asize);
     return bp;
 }
-
-/*
- * find_fit - find available block in free list
- */
-static void *find_fit(size_t asize)
-{
-    void *bp;
-    for (bp = SUCC_P(heap_listp); !GET_ALLOC(HDRP(bp)); bp = SUCC_P(bp))
-    {
-        if ((asize <= GET_SIZE(HDRP(bp))))
-        {
-            return bp;
-        }
-    }
-    return NULL;
-}
-
-/*
- * place - memory of adjusted size is allocated in available block
- */
-static void place(void *bp, size_t asize)
-{
-    size_t csize = GET_SIZE(HDRP(bp));
-    change_point(bp);
-    /* minimum bytes we can allocate is 16 bytes. */
-    if ((csize - asize) >= (2 * DSIZE))
-    {
-        PUT(HDRP(bp), PACK(asize, 1));
-        PUT(FTRP(bp), PACK(asize, 1));
-
-        bp = NEXT_BLKP(bp);
-
-        PUT(HDRP(bp), PACK(csize - asize, 0));
-        PUT(FTRP(bp), PACK(csize - asize, 0));
-
-        /* move pred and succ pointer of current free block to pred pointer and succ pointer of next free block  */
-        connect_root(bp);
-    }
-    else
-    {
-        // after allocate, if left available block size is lower than 16 bytes(minimum bytes), total block size is allocated
-        PUT(HDRP(bp), PACK(csize, 1));
-        PUT(FTRP(bp), PACK(csize, 1));
-    }
-}
-/*
- * connect_root - move new free block to first block and connect with root
- */
-static void *connect_root(void *ptr)
-{
-    SUCC_P(ptr) = SUCC_P(heap_listp);
-    PRED_P(ptr) = heap_listp;
-    PRED_P(SUCC_P(heap_listp)) = ptr;
-    SUCC_P(heap_listp) = ptr;
-}
-/*
- * change_point - Freeing a block does nothing.
- */
-static void *change_point(void *ptr)
-{
-    SUCC_P(PRED_P(ptr)) = SUCC_P(ptr);
-    PRED_P(SUCC_P(ptr)) = PRED_P(ptr);
-}
 /*
  * mm_free - Freeing a block does nothing.
  */
@@ -255,51 +261,9 @@ void mm_free(void *ptr)
     /*3. connect avaliable blocks if free block is adjacent to current freed black*/
     coalesce(ptr);
 }
-
-/*
- * coalesce - connect blocks if free block is adjacent to current freed block
- */
-static void *coalesce(void *ptr)
-{
-    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(ptr)));
-    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
-    size_t size = GET_SIZE(HDRP(ptr));
-
-    /*case 2. next block of adjacent blocks is free */
-    if (prev_alloc && !next_alloc)
-    {
-        change_point(NEXT_BLKP(ptr));
-        size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));
-        PUT(HDRP(ptr), PACK(size, 0));
-        PUT(FTRP(ptr), PACK(size, 0));
-    }
-    /*case 3. previous block of adjacent blocks is free */
-    else if (!prev_alloc && next_alloc)
-    {
-        change_point(PREV_BLKP(ptr));
-        size += GET_SIZE(HDRP(PREV_BLKP(ptr)));
-        PUT(FTRP(ptr), PACK(size, 0));
-        PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
-        ptr = PREV_BLKP(ptr);
-    }
-    /*case 4. all adjacent block are free */
-    else if (!prev_alloc && !next_alloc)
-    {
-        change_point(PREV_BLKP(ptr));
-        change_point(NEXT_BLKP(ptr));
-        size += GET_SIZE(HDRP(PREV_BLKP(ptr))) + GET_SIZE(FTRP(NEXT_BLKP(ptr)));
-        PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));
-        PUT(FTRP(NEXT_BLKP(ptr)), PACK(size, 0));
-        ptr = PREV_BLKP(ptr);
-    }
-    connect_root(ptr);
-    return ptr;
-}
-
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
-
 void *mm_realloc(void *ptr, size_t size)
 {
     /*[exception 1] free ptr and return zero if requested 'size' is zero or under zero*/
